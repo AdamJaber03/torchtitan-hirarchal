@@ -12,6 +12,10 @@ from typing import Any
 import numpy as np
 from renderers import build_training_sample, Message, Renderer, ToolSpec
 
+from torchtitan.components.data.augmentation import (
+    TextAugmentation,
+    TokenAugmentation,
+)
 from torchtitan.components.data.dataset import (
     SampleProcessor,
     SingleDatasetConfig,
@@ -35,30 +39,69 @@ def _read_text(sample: dict[str, Any]) -> str:
 
 
 class TextProcessor(SampleProcessor):
-    """Tokenizes plain text into next-token input and label pairs."""
+    """Tokenizes plain text into next-token input and label pairs.
+
+    Optional augmentations run in order: text augmentations on the raw text,
+    then token augmentations on the tokenized document (BOS and EOS included)
+    before the shift. All of them draw from the per-document ``rng``.
+    """
 
     @dataclass(kw_only=True, slots=True)
     class Config(SampleProcessor.Config):
         text_fn: Callable[[dict[str, Any]], str] = _read_text
+        text_augmentations: tuple[TextAugmentation.Config, ...] = ()
+        token_augmentations: tuple[TokenAugmentation.Config, ...] = ()
 
     def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
         self._tokenizer = context.tokenizer
         self._text_fn = config.text_fn
+        self._text_augmentations = [
+            augmentation.build(context=context)
+            for augmentation in config.text_augmentations
+        ]
+        self._token_augmentations = [
+            augmentation.build(context=context)
+            for augmentation in config.token_augmentations
+        ]
 
     def __call__(
         self, sample: dict[str, Any], rng: np.random.Generator
     ) -> TextSequence | None:
-        del rng
-        input_ids = np.asarray(
-            self._tokenizer.encode(self._text_fn(sample), add_bos=True, add_eos=True),
+        text = self._text_fn(sample)
+        for text_augmentation in self._text_augmentations:
+            text = text_augmentation(text, rng)
+        token_ids = np.asarray(
+            self._tokenizer.encode(text, add_bos=True, add_eos=True),
             dtype=np.int64,
         )
-        if len(input_ids) < 2:
+        if self._token_augmentations:
+            token_ids = self._augment_tokens(token_ids, rng)
+        if len(token_ids) < 2:
             return None
         return TextSequence(
-            input_ids=input_ids[:-1],
-            labels=input_ids[1:],
+            input_ids=token_ids[:-1],
+            labels=token_ids[1:],
         )
+
+    def _augment_tokens(
+        self, token_ids: np.ndarray, rng: np.random.Generator
+    ) -> np.ndarray:
+        bos_id = getattr(self._tokenizer, "bos_id", None)
+        eos_id = self._tokenizer.eos_id
+        has_bos = bos_id is not None and len(token_ids) > 0 and token_ids[0] == bos_id
+        has_eos = eos_id is not None and len(token_ids) > 0 and token_ids[-1] == eos_id
+        for token_augmentation in self._token_augmentations:
+            token_ids = np.asarray(token_augmentation(token_ids, rng), dtype=np.int64)
+            # Packed documents are delimited by these tokens; an augmentation
+            # that moves them would silently merge or split documents.
+            if (has_bos and (len(token_ids) == 0 or token_ids[0] != bos_id)) or (
+                has_eos and (len(token_ids) == 0 or token_ids[-1] != eos_id)
+            ):
+                raise ValueError(
+                    f"{type(token_augmentation).__name__} must keep the "
+                    "document's BOS first and EOS last."
+                )
+        return token_ids
 
 
 def _require_token_prefix(full_tokens: list[int], prompt_tokens: list[int]) -> None:

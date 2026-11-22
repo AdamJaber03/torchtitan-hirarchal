@@ -226,6 +226,57 @@ packed_tokens_ds = ConcatThenSplitPackingConfig(
 )
 ```
 
+## Augmentations
+
+`TextProcessor` applies optional per-document augmentations, in order:
+
+```
+text_fn(row) -> text augmentations -> encode (BOS ... EOS) -> token augmentations -> shift
+```
+
+- `TextAugmentation` transforms the raw text before tokenization.
+- `TokenAugmentation` transforms the whole tokenized document, BOS and EOS
+  included, before the input/label shift. Inputs and labels therefore change
+  consistently. The length may change, because this runs before packing. The
+  BOS and EOS that `TextProcessor` added must stay first and last, or it raises:
+  packing relies on them to keep documents apart.
+
+Both are `Configurable`s selected by putting their `Config`s on the processor.
+There is no string registry:
+
+```python
+from dataclasses import dataclass
+
+from torchtitan.components.data import TextAugmentation
+
+
+class LowercaseText(TextAugmentation):
+    @dataclass(kw_only=True, slots=True)
+    class Config(TextAugmentation.Config):
+        prob: float
+
+    def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
+        self.prob = config.prob
+
+    def __call__(self, text: str, rng: np.random.Generator) -> str:
+        return text.lower() if rng.random() < self.prob else text
+
+
+processor = TextProcessor.Config(text_augmentations=(LowercaseText.Config(prob=0.1),))
+```
+
+Draw all randomness from the `rng` argument. Never use `random`, `np.random`
+or torch's global generators, and keep no mutable state on `self`. Grain resets
+`rng` for every document from:
+- the seed of that rank's stream, derived from the loader seed, the dataset's
+  position in a mix, and the DP rank;
+- the document's position in that stream.
+
+So two runs with the same seed and DP degree get identical augmentations; DP
+ranks, mix children and documents never share draws; and a resumed run
+continues the same sequence. Validation datasets are configured separately and
+are not augmented unless their own processor lists augmentations.
+
 # SFT
 
 SFT changes the processor and packing policy, not the loader:

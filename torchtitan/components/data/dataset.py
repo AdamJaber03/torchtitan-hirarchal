@@ -68,6 +68,16 @@ class TextSequence:
             )
 
 
+def _per_rank_seed(seed: int, dp_rank: int) -> int:
+    """Seed for one rank's processor stream on a streaming dataset.
+
+    Mixed children already get ``seed + child_index``, so ``seed + dp_rank``
+    would give child k on rank r the same stream as child 0 on rank r + k.
+    Hashing the pair keeps every (child, rank) stream independent.
+    """
+    return int(np.random.SeedSequence((seed, dp_rank)).generate_state(1)[0])
+
+
 class SampleProcessor(Configurable, ABC):
     """Configured row processor using Grain-provided deterministic randomness."""
 
@@ -196,7 +206,9 @@ class SingleDatasetConfig:
         if self.processor is not None:
             dataset = dataset.random_map(
                 self.processor.build(context=context),
-                seed=dataset_iteration_policy.seed + dataset_iteration_policy.dp_rank,
+                seed=_per_rank_seed(
+                    dataset_iteration_policy.seed, dataset_iteration_policy.dp_rank
+                ),
             )
         for filter_fn in self.post_filters:
             dataset = dataset.filter(filter_fn)
