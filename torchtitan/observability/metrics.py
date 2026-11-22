@@ -171,6 +171,10 @@ class WandBLogger(BaseLogger):
         log_dir: str,
         config_dict: dict[str, Any] | None = None,
         tag: str | None = None,
+        entity: str | None = None,
+        project: str | None = None,
+        name: str | None = None,
+        run_id: str | None = None,
     ):
         # Import wandb here to avoid startup import
         import wandb
@@ -186,17 +190,24 @@ class WandBLogger(BaseLogger):
         if tags_env := os.getenv("WANDB_RUN_TAGS"):
             tags = [t.strip() for t in tags_env.split(",") if t.strip()] or None
 
+        run_id = run_id or os.getenv("WANDB_RUN_ID", None)
+        resume_from = os.getenv("WANDB_RESUME_FROM", None)
+        fork_from = os.getenv("WANDB_FORK_FROM", None)
+        # A fixed run id makes a restarted job append to its W&B run instead of
+        # failing on the existing id.
+        resume = "allow" if run_id and not (resume_from or fork_from) else None
         self.wandb.init(
-            entity=os.getenv("WANDB_TEAM", None),
-            project=os.getenv("WANDB_PROJECT", "torchtitan"),
-            name=os.getenv("WANDB_RUN_NAME", None),
-            id=os.getenv("WANDB_RUN_ID", None),
+            entity=entity or os.getenv("WANDB_TEAM", None),
+            project=project or os.getenv("WANDB_PROJECT", "torchtitan"),
+            name=name or os.getenv("WANDB_RUN_NAME", None),
+            id=run_id,
+            resume=resume,
             notes=os.getenv("WANDB_RUN_NOTES", None),
             tags=tags,
             group=os.getenv("WANDB_RUN_GROUP", None),
             job_type=os.getenv("WANDB_RUN_JOB_TYPE", None),
-            resume_from=os.getenv("WANDB_RESUME_FROM", None),
-            fork_from=os.getenv("WANDB_FORK_FROM", None),
+            resume_from=resume_from,
+            fork_from=fork_from,
             dir=log_dir,
             config=config_dict,
         )
@@ -389,6 +400,20 @@ class MetricsProcessor(Configurable):
         enable_wandb: bool = False
         """Whether to log metrics to Weights & Biases"""
 
+        wandb_entity: str | None = None
+        """W&B user or team. Falls back to $WANDB_TEAM."""
+
+        wandb_project: str | None = None
+        """W&B project. Falls back to $WANDB_PROJECT, then "torchtitan"."""
+
+        wandb_run_name: str | None = None
+        """W&B run display name. Falls back to $WANDB_RUN_NAME."""
+
+        wandb_run_id: str | None = None
+        """W&B run id, falling back to $WANDB_RUN_ID. With an id, a restarted
+        job resumes logging into the same run; steps at or below the run's
+        last logged step are dropped by W&B."""
+
         enable_mlflow: bool = False
         """Whether to log metrics to MLflow"""
 
@@ -547,7 +572,13 @@ class MetricsProcessor(Configurable):
             logger.debug("Attempting to create WandB logger")
             try:
                 wandb_logger = WandBLogger(
-                    base_log_dir, config_dict=config_dict, tag=tag
+                    base_log_dir,
+                    config_dict=config_dict,
+                    tag=tag,
+                    entity=config.wandb_entity,
+                    project=config.wandb_project,
+                    name=config.wandb_run_name,
+                    run_id=config.wandb_run_id,
                 )
                 logger_container.add_logger(wandb_logger)
             except Exception as e:
