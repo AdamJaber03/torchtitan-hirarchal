@@ -504,6 +504,46 @@ class HuggingFaceTokenizer(BaseTokenizer):
         return self.tokenizer.id_to_token(token_id)
 
 
+class ByteTokenizer(BaseTokenizer):
+    """UTF-8 byte tokenizer: one token per byte, vocabulary of 256.
+
+    EOS is byte 0xFF, which never occurs in valid UTF-8, so it cannot collide
+    with text. There is no BOS: packed documents are delimited by ``positions``
+    resetting to 0, which byte-level models use directly.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseTokenizer.Config):
+        pass
+
+    vocab_size: ClassVar[int] = 256
+
+    def __init__(self, config: Config | None = None, *, tokenizer_path: str = ""):
+        # The trainer passes ``tokenizer_path`` to every tokenizer; bytes need
+        # no assets.
+        del config, tokenizer_path
+        super().__init__()
+        self.eos_id = 0xFF
+        self.bos_id = None
+
+    def encode(
+        self, text: str, *, add_bos: bool = False, add_eos: bool = False
+    ) -> list[int]:
+        del add_bos  # no BOS token
+        token_ids = list(text.encode("utf-8"))
+        if add_eos:
+            token_ids.append(self.eos_id)
+        return token_ids
+
+    def decode(self, token_ids: Sequence[int]) -> str:
+        return bytes(t for t in token_ids if t != self.eos_id).decode(
+            "utf-8", errors="replace"
+        )
+
+    def get_vocab_size(self) -> int:
+        return self.vocab_size
+
+
 class MultiModalTokenizer(HuggingFaceTokenizer):
     """Single source of truth for multimodal special tokens.
 
