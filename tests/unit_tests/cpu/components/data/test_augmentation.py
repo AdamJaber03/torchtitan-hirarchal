@@ -219,3 +219,29 @@ def test_loader_resume_replays_identical_augmentations():
         got = next(restored_iterator)
         assert torch.equal(want.input, got.input)
         assert torch.equal(want.labels, got.labels)
+
+
+def test_eos_as_bos_makes_first_text_token_a_label():
+    import dataclasses
+
+    context = dataclasses.replace(_CONTEXT, tokenizer=_NoBosTokenizer())
+    processor = TextProcessor.Config(eos_as_bos=True).build(context=context)
+    sequence = processor({"text": "hi"}, np.random.default_rng(0))
+    text_ids = _NoBosTokenizer().encode("hi")
+    eos = _NoBosTokenizer.eos_id
+    assert sequence.input_ids.tolist() == [eos] + text_ids
+    assert sequence.labels.tolist() == text_ids + [eos]
+
+
+def test_eos_as_bos_rejects_tokenizer_with_bos():
+    with pytest.raises(ValueError, match="already starts documents"):
+        TextProcessor.Config(eos_as_bos=True).build(context=_CONTEXT)
+
+
+class _NoBosTokenizer:
+    bos_id = None
+    eos_id = 2
+
+    def encode(self, text, add_bos=False, add_eos=False):
+        del add_bos
+        return [ord(char) % 250 + 10 for char in text] + [self.eos_id] * add_eos

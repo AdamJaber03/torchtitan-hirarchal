@@ -94,7 +94,7 @@ def _validate_loss(validator, model_parts, prepared, *, step):
     ]
     validator.dl_config.build = lambda **kwargs: _EvalLoader(rows)
     losses = []
-    validator.metrics_processor.log_validation = lambda *, loss, step: losses.append(
+    validator.metrics_processor.log_validation = lambda *, loss, step, **_: losses.append(
         loss
     )
     with patch.object(
@@ -336,7 +336,7 @@ def test_varlen_eval_replays_different_document_counts():
                 metadata = prepared[0][2]["attention_metadata"][VarlenInnerAttention]
                 assert metadata.cu_seq_q.shape == (6,)
                 assert metadata.max_q == metadata.max_k == 8
-                expected = validator._validate_body([model], prepared).clone()
+                expected = validator._validate_body([model], prepared)[0].clone()
                 actual = _validate_loss(
                     validator, [model], prepared, step=step + 1
                 ).clone()

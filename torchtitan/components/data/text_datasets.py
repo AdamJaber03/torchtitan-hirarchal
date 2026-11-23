@@ -51,9 +51,23 @@ class TextProcessor(SampleProcessor):
         text_fn: Callable[[dict[str, Any]], str] = _read_text
         text_augmentations: tuple[TextAugmentation.Config, ...] = ()
         token_augmentations: tuple[TokenAugmentation.Config, ...] = ()
+        eos_as_bos: bool = False
+        """Start every document with the EOS token, as a BOS, for tokenizers
+        without one (Qwen3, ByteTokenizer). Then the first text token is a
+        label too, so every byte of the text is predicted; without it the
+        first token is only ever an input. Rejected for tokenizers with a BOS."""
 
     def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
         self._tokenizer = context.tokenizer
+        self._eos_as_bos = config.eos_as_bos
+        if self._eos_as_bos:
+            if getattr(self._tokenizer, "bos_id", None) is not None:
+                raise ValueError(
+                    "eos_as_bos is for tokenizers without a BOS; this tokenizer "
+                    "already starts documents with its BOS token."
+                )
+            if self._tokenizer.eos_id is None:
+                raise ValueError("eos_as_bos needs a tokenizer with an EOS token.")
         self._text_fn = config.text_fn
         self._text_augmentations = [
             augmentation.build(context=context)
@@ -74,6 +88,8 @@ class TextProcessor(SampleProcessor):
             self._tokenizer.encode(text, add_bos=True, add_eos=True),
             dtype=np.int64,
         )
+        if self._eos_as_bos:
+            token_ids = np.concatenate(([self._tokenizer.eos_id], token_ids))
         if self._token_augmentations:
             token_ids = self._augment_tokens(token_ids, rng)
         if len(token_ids) < 2:
@@ -86,8 +102,8 @@ class TextProcessor(SampleProcessor):
     def _augment_tokens(
         self, token_ids: np.ndarray, rng: np.random.Generator
     ) -> np.ndarray:
-        bos_id = getattr(self._tokenizer, "bos_id", None)
         eos_id = self._tokenizer.eos_id
+        bos_id = eos_id if self._eos_as_bos else getattr(self._tokenizer, "bos_id", None)
         has_bos = bos_id is not None and len(token_ids) > 0 and token_ids[0] == bos_id
         has_eos = eos_id is not None and len(token_ids) > 0 and token_ids[-1] == eos_id
         for token_augmentation in self._token_augmentations:

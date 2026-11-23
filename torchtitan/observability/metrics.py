@@ -701,8 +701,15 @@ class MetricsProcessor(Configurable):
         self.device_memory_monitor.reset_peak_stats()
 
     def log_validation(
-        self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None
+        self,
+        loss: float | None,
+        step: int,
+        extra_metrics: dict[str, Any] | None = None,
+        loss_metrics: dict[str, float] | None = None,
     ):
+        """Log validation results. ``loss`` is the validation loss (``None``
+        when only named losses are scored); ``loss_metrics`` are named losses
+        or loss components, logged as ``validation_metrics/<name>`` and printed."""
         time_delta = time.perf_counter() - self.time_last_log
 
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
@@ -712,8 +719,10 @@ class MetricsProcessor(Configurable):
             time_delta * self.parallelism_context.non_data_parallel_size
         )
 
+        loss_metrics = loss_metrics or {}
         metrics = {
-            "validation_metrics/loss": loss,
+            **({"validation_metrics/loss": loss} if loss is not None else {}),
+            **{f"validation_metrics/{k}": v for k, v in loss_metrics.items()},
             "validation_metrics/throughput(tps)": tps,
             "validation_metrics/memory/max_active(GiB)": device_mem_stats.max_active_gib,
             "validation_metrics/memory/max_active(%)": device_mem_stats.max_active_pct,
@@ -727,9 +736,12 @@ class MetricsProcessor(Configurable):
         self.logger.log(metrics, step)
 
         color = self.color
+        losses = ([f"loss: {loss:7.4f}"] if loss is not None else []) + [
+            f"{k}: {v:7.4f}" for k, v in loss_metrics.items()
+        ]
         logger.info(
             f"{color.yellow}validate step: {step:2}  "
-            f"{color.green}loss: {loss:7.4f}  "
+            f"{color.green}{'  '.join(losses)}  "
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
             f"{color.blue}tps: {round(tps):,}{color.reset}"

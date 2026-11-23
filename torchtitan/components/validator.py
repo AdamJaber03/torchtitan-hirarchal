@@ -20,7 +20,14 @@ from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLo
 from torchtitan.components.data.loader import BaseDataLoader
 from torchtitan.components.data.text_datasets import DATASETS
 from torchtitan.components.data.types import TrainingMicrobatch
-from torchtitan.components.loss import LossFunction
+from torchtitan.components.loss import (
+    ChunkedLossWrapper,
+    combine_loss_metrics,
+    IGNORE_INDEX,
+    loss_config_from_spec,
+    LossFunction,
+    uses_byte_normalizer,
+)
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.config import Configurable
 from torchtitan.config.parallelism import ParallelismConfig
@@ -111,12 +118,34 @@ class Validator(BaseValidator):
         )
         """DataLoader configuration for validation"""
 
+        losses: list[dict[str, Any]] | None = None
+        """Named losses to score instead of the training loss, as loss specs
+        (see ``loss_config_from_spec``), e.g.
+        ``[{"loss_type": "cross_entropy", "name": "ce"}]``. Each is reported as
+        ``validation_metrics/<name>`` from one forward pass. ``None`` scores the
+        training loss (and, for a ``MixedLoss``, also each of its terms)."""
+
         def __post_init__(self):
             BaseValidator.Config.__post_init__(self)
+            if self.losses is not None:
+                # Fail at config time on bad specs or repeated names.
+                self._named_losses_config()
             if not (self.steps > 0 or self.steps == -1):
                 raise ValueError(
                     f"validation steps must be positive or -1, got {self.steps}"
                 )
+
+        def _named_losses_config(self):
+            """The named losses as one weight-1 ``MixedLoss`` config."""
+            if not self.losses:
+                raise ValueError("validator.losses must be None or a non-empty list.")
+            return loss_config_from_spec(
+                {
+                    "loss_type": "mixed",
+                    "losses": [{"weight": 1.0, "loss": spec} for spec in self.losses],
+                },
+                path="validator.losses",
+            )
 
     # TODO: improve the constructor signature
     def __init__(
@@ -144,6 +173,31 @@ class Validator(BaseValidator):
         self.tokenizer = tokenizer
         self.parallelism_context = parallelism_context
         self.loss_fn = loss_fn
+        # With named losses, score them (and only them) with their own wrapper
+        # that shares the training wrapper's lm_head and chunking.
+        self.named_losses = config.losses is not None
+        # Byte length of each token id, when a named loss is normalized by the
+        # UTF-8 bytes its labels cover (bits_per_byte).
+        self._token_byte_lengths: torch.Tensor | None = None
+        if self.named_losses:
+            if parallelism_context.pp_enabled:
+                raise ValueError(
+                    "validator.losses is not supported with pipeline parallelism."
+                )
+            named = config._named_losses_config()
+            if uses_byte_normalizer(named):
+                self._token_byte_lengths = torch.tensor(
+                    tokenizer.token_byte_lengths(), dtype=torch.int64
+                )
+            if isinstance(loss_fn, ChunkedLossWrapper):
+                assert loss_fn.lm_head is not None, "lm_head must be set first"
+                wrapper = ChunkedLossWrapper.Config(
+                    num_chunks=loss_fn.num_chunks, loss_fn=named
+                ).build()
+                wrapper.set_lm_head(loss_fn.lm_head)
+                self.loss_fn = wrapper
+            else:
+                self.loss_fn = named.build()
         # A bounded validation run repeats data; steps=-1 consumes one finite pass.
         self.dl_config = replace(config.dataloader, repeat=config.steps != -1)
         self.dp_world_size = dp_world_size
@@ -246,6 +300,7 @@ class Validator(BaseValidator):
                     losses=losses,
                     return_outputs=False,
                 )
+                metrics: dict[str, torch.Tensor] = {}
                 if self.pp_has_last_stage:
                     assert losses is not None
                     loss_sum = torch.stack(losses).sum().to(utils.device_type)
@@ -261,10 +316,66 @@ class Validator(BaseValidator):
                 assert len(prepared) == len(model_parts) == 1
                 inputs, labels, kwargs = prepared[0]
                 predictions = model_parts[0](inputs, **kwargs)
-                loss_sum, _ = self.loss_fn(predictions, labels)
+                loss_sum, metrics = self.loss_fn(predictions, labels)
                 del predictions
             post_validate_fsdp_for_accelerator_graph(model_parts)
-        return loss_sum.detach()
+        return loss_sum.detach(), {k: v.detach() for k, v in metrics.items()}
+
+    def _count_label_bytes(self, labels: torch.Tensor) -> torch.Tensor:
+        """UTF-8 bytes of the text covered by the valid labels."""
+        assert self._token_byte_lengths is not None
+        if not isinstance(labels, torch.Tensor):
+            raise ValueError("bits_per_byte needs a single labels tensor.")
+        table = self._token_byte_lengths
+        if table.device != labels.device:
+            table = self._token_byte_lengths = table.to(labels.device)
+        valid = labels != IGNORE_INDEX
+        return torch.where(valid, table[labels.clamp(min=0)], 0).sum()
+
+    def _reduce_metrics(
+        self,
+        metrics: dict[str, torch.Tensor],
+        num_global_valid_tokens: int,
+        num_global_label_bytes: int | None = None,
+    ) -> dict[str, float]:
+        """Reduce summed per-rank loss metrics to global values.
+
+        Validation passes no token counts to the loss, so ``/mean`` and
+        ``/frac`` values are sums: they are summed over the loss mesh and
+        divided by the global valid tokens (``/per_byte``: by the global label
+        bytes). ``<name>/mean`` and ``<name>/per_byte`` are reported as
+        ``<name>``. ``/max`` and ``/min`` keys are reduced as such.
+        """
+        parallelism_context = self.parallelism_context
+        loss_mesh = (
+            parallelism_context.get_optional_mesh("loss")
+            if parallelism_context.dp_cp_enabled
+            else None
+        )
+        reduced: dict[str, float] = {}
+        for key in sorted(metrics):  # same order on every rank for the collectives
+            value = metrics[key]
+            if key.endswith("/max"):
+                out = dist_utils.dist_max(value, loss_mesh) if loss_mesh else value.item()
+            elif key.endswith("/min"):
+                out = -dist_utils.dist_max(-value, loss_mesh) if loss_mesh else value.item()
+            else:
+                total = dist_utils.dist_sum(value, loss_mesh) if loss_mesh else value.item()
+                if key.endswith("/per_byte"):
+                    if not num_global_label_bytes:
+                        raise ValueError(
+                            f"{key} needs the label byte count, which is zero or "
+                            "was not counted."
+                        )
+                    out = total / num_global_label_bytes
+                else:
+                    out = total / num_global_valid_tokens
+            name = key
+            for suffix in ("/mean", "/per_byte"):
+                if key.endswith(suffix):
+                    name = key[: -len(suffix)]
+            reduced[name] = float(out)
+        return reduced
 
     @sl.log_trace_span("eval")
     @torch.no_grad()
@@ -285,8 +396,10 @@ class Validator(BaseValidator):
             parallelism_context = self.parallelism_context
 
             accumulated_loss: torch.Tensor | None = None
+            accumulated_metrics: dict[str, torch.Tensor] = {}
             evaluate = None
             device_type = utils.device_type
+            local_label_bytes = torch.zeros((), dtype=torch.int64, device=device_type)
             total_global_valid_tokens = torch.zeros(
                 (), dtype=torch.int64, device=device_type
             )
@@ -350,14 +463,21 @@ class Validator(BaseValidator):
                             max_context_length=self.seq_len,
                         )
                     prepared.append((inputs, labels, kwargs))
+                    if self._token_byte_lengths is not None:
+                        local_label_bytes.add_(self._count_label_bytes(labels))
                 if evaluate is None:
                     evaluate = self._init_validate_fn(model_parts)
-                loss_sum = evaluate(prepared)
+                loss_sum, step_metrics = evaluate(prepared)
 
                 if accumulated_loss is None:
                     accumulated_loss = loss_sum.clone()
                 else:
                     accumulated_loss.add_(loss_sum)
+                # Clone: under accelerator graphs the outputs alias graph buffers.
+                combine_loss_metrics(
+                    accumulated_metrics,
+                    {k: v.clone() for k, v in step_metrics.items()},
+                )
                 total_global_valid_tokens.add_(global_valid_tokens)
                 num_steps += 1
 
@@ -384,8 +504,26 @@ class Validator(BaseValidator):
             else:
                 global_loss_sum = float(accumulated_loss.item())
             global_avg_loss = global_loss_sum / num_global_valid_tokens
+            num_global_label_bytes = None
+            if self._token_byte_lengths is not None:
+                num_global_label_bytes = int(
+                    dist_utils.dist_sum(
+                        local_label_bytes, parallelism_context.get_optional_mesh("loss")
+                    )
+                    if parallelism_context.dp_cp_enabled
+                    else local_label_bytes.item()
+                )
+            loss_metrics = self._reduce_metrics(
+                accumulated_metrics, num_global_valid_tokens, num_global_label_bytes
+            )
 
-            self.metrics_processor.log_validation(loss=global_avg_loss, step=step)
+            self.metrics_processor.log_validation(
+                # Named losses replace the training loss, whose weight-1 sum
+                # over them means nothing on its own.
+                loss=None if self.named_losses else global_avg_loss,
+                step=step,
+                loss_metrics=loss_metrics,
+            )
         finally:
             for module, training in modes:
                 module.training = training

@@ -21,6 +21,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torchtitan.components.checkpointer import DATALOADER
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.data.types import TrainingMicrobatch
+from torchtitan.components.loss import combine_loss_metrics
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 from torchtitan.components.validator import BaseValidator, Validator
 from torchtitan.config import apply_overrides, Configurable, OverrideConfig
@@ -439,10 +440,15 @@ class Trainer(Configurable):
                 global_avg_loss = global_max_loss = float(accumulated_loss.item())
                 global_ntokens_seen = engine.ntokens_seen
 
+            loss_metrics = self._reduce_loss_metrics(
+                forward_backward_result.loss_metrics
+            )
+
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
             **lr_metrics,
             **collect_aux_loss_metrics(parallelism_context),
+            **loss_metrics,
         }
         self.metrics_processor.log(
             engine.num_completed_steps,
@@ -451,6 +457,49 @@ class Trainer(Configurable):
             float(grad_norm.item()),
             extra_metrics=extra_metrics,
         )
+
+    def _reduce_loss_metrics(
+        self, loss_metrics: list[list[dict[str, torch.Tensor]]]
+    ) -> dict[str, float]:
+        """Reduce the loss's own metrics (e.g. each ``MixedLoss`` term) over
+        microbatches and the loss mesh, keyed ``loss_metrics/<key>``
+        (``loss_metrics/<name>`` for a term's ``<name>/mean``).
+
+        Mean/frac values are pre-normalized by the global valid-token count, so
+        they are summed; ``/max`` and ``/min`` keys take the max and min.
+        """
+        parallelism_context = self.engine.parallelism_context
+        if parallelism_context.pp_enabled:
+            # Only the last PP stage has loss metrics, so ranks would disagree
+            # on the keys of the collectives below.
+            return {}
+        local: dict[str, torch.Tensor] = {}
+        for group_metrics in loss_metrics:
+            for microbatch_metrics in group_metrics:
+                combine_loss_metrics(
+                    local, {k: v.detach() for k, v in microbatch_metrics.items()}
+                )
+        loss_mesh = (
+            parallelism_context.get_optional_mesh("loss")
+            if parallelism_context.dp_cp_enabled
+            else None
+        )
+        reduced: dict[str, float] = {}
+        for key in sorted(local):  # same order on every rank for the collectives
+            value = local[key]
+            if loss_mesh is None:
+                reduced[key] = float(value.item())
+            elif key.endswith("/max"):
+                reduced[key] = dist_utils.dist_max(value, loss_mesh)
+            elif key.endswith("/min"):
+                reduced[key] = -dist_utils.dist_max(-value, loss_mesh)
+            else:
+                reduced[key] = dist_utils.dist_sum(value, loss_mesh)
+        # "<name>/mean" (a MixedLoss term's unweighted value) is logged as "<name>".
+        return {
+            f"loss_metrics/{key[: -len('/mean')] if key.endswith('/mean') else key}": value
+            for key, value in reduced.items()
+        }
 
     @record
     def train(self):

@@ -611,3 +611,56 @@ instantiate_parametrized_tests(TestTokenizerIntegration)
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTokenByteLengths(unittest.TestCase):
+    TEXTS = ["plain ascii", "naïve café", "مرحبا بالعالم", "🦩🪼 emoji", "𓀀 glyph"]
+
+    def test_byte_tokenizer(self):
+        from torchtitan.components.tokenizer import ByteTokenizer
+
+        tokenizer = ByteTokenizer()
+        lengths = tokenizer.token_byte_lengths()
+        self.assertEqual(lengths[tokenizer.eos_id], 0)
+        for text in self.TEXTS:
+            ids = tokenizer.encode(text, add_eos=True)
+            self.assertEqual(sum(lengths[i] for i in ids), len(text.encode()))
+
+    def test_byte_level_bpe_matches_utf8_bytes(self):
+        from tokenizers import decoders, models, pre_tokenizers, trainers
+
+        tokenizer = Tokenizer(models.BPE())
+        tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        tokenizer.decoder = decoders.ByteLevel()
+        trainer = trainers.BpeTrainer(
+            vocab_size=400,
+            special_tokens=["<eos>"],
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        )
+        tokenizer.train_from_iterator(self.TEXTS * 20, trainer=trainer)
+        tmp = tempfile.mkdtemp()
+        try:
+            tokenizer.save(os.path.join(tmp, "tokenizer.json"))
+            with open(os.path.join(tmp, "tokenizer_config.json"), "w") as f:
+                json.dump({"eos_token": "<eos>"}, f)
+            hf = HuggingFaceTokenizer(tokenizer_path=tmp)
+            lengths = hf.token_byte_lengths()
+            self.assertEqual(lengths[hf.eos_id], 0)
+            for text in self.TEXTS:
+                ids = hf.encode(text, add_bos=True, add_eos=True)
+                # Per-token decoding would count U+FFFD for split characters.
+                self.assertEqual(sum(lengths[i] for i in ids), len(text.encode()))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_non_byte_level_vocab_raises(self):
+        tokenizer = Tokenizer(WordLevel({"a b": 0, "[UNK]": 1}, unk_token="[UNK]"))
+        tokenizer.pre_tokenizer = WhitespaceSplit()
+        tmp = tempfile.mkdtemp()
+        try:
+            tokenizer.save(os.path.join(tmp, "tokenizer.json"))
+            hf = HuggingFaceTokenizer(tokenizer_path=tmp)
+            with self.assertRaises(NotImplementedError):
+                hf.token_byte_lengths()
+        finally:
+            shutil.rmtree(tmp)

@@ -6,6 +6,7 @@
 
 import copy
 import itertools
+import math
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -33,6 +34,10 @@ from torchtitan.components.loss import (
     GradAccumulator,
     IGNORE_INDEX,
     Loss,
+    loss_config_from_spec,
+    MixedLoss,
+    uses_byte_normalizer,
+    WeightedLoss,
 )
 from torchtitan.config import ParallelismConfig
 from torchtitan.config.transform import LoRATransform, transform_model_config_
@@ -1730,3 +1735,157 @@ class TestChunkedLossWrapperSPMD(DTensorTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMixedLoss(unittest.TestCase):
+    """MixedLoss, the loss registry and dict loss specs."""
+
+    def _spec(self, *terms):
+        return {
+            "loss_type": "mixed",
+            "losses": [{"weight": w, "loss": loss} for w, loss in terms],
+        }
+
+    def test_spec_builds_typed_configs(self):
+        config = loss_config_from_spec(
+            self._spec(
+                (1.0, {"loss_type": "cross_entropy"}),
+                (0.5, self._spec((2.0, {"loss_type": "mse", "name": "m"}))),
+            )
+        )
+        self.assertIsInstance(config, MixedLoss.Config)
+        self.assertIsInstance(config.losses[0].loss, CrossEntropyLoss.Config)
+        inner = config.losses[1].loss
+        self.assertIsInstance(inner, MixedLoss.Config)
+        self.assertEqual(inner.losses[0].weight, 2.0)
+        self.assertEqual(inner.losses[0].loss.name, "m")
+
+    def test_spec_errors(self):
+        cases = {
+            "missing 'loss_type'": {"name": "x"},
+            "unknown loss_type": {"loss_type": "nope"},
+            "unknown fields": {"loss_type": "cross_entropy", "bogus": 1},
+            "missing required fields": {"loss_type": "mixed"},
+            "exactly the keys": self._spec((1.0, {"loss_type": "mse"})) | {
+                "losses": [{"weight": 1.0}]
+            },
+            "unique": self._spec(
+                (1.0, {"loss_type": "cross_entropy"}),
+                (1.0, {"loss_type": "cross_entropy"}),
+            ),
+            "at least one": {"loss_type": "mixed", "losses": []},
+        }
+        for message, spec in cases.items():
+            with self.subTest(message), self.assertRaisesRegex(ValueError, message):
+                loss_config_from_spec(spec)
+        with self.assertRaisesRegex(TypeError, "weight must be a number"):
+            loss_config_from_spec(self._spec(("1", {"loss_type": "mse"})))
+
+    def test_chunked_wrapper_cannot_be_a_term(self):
+        with self.assertRaisesRegex(ValueError, "ChunkedLossWrapper cannot"):
+            MixedLoss.Config(
+                losses=[WeightedLoss(weight=1.0, loss=ChunkedLossWrapper.Config())]
+            )
+
+    def test_total_gradients_and_metrics(self):
+        torch.manual_seed(0)
+        logits = torch.randn(12, 9, requires_grad=True)
+        labels = torch.randint(0, 9, (12,))
+        labels[3] = IGNORE_INDEX
+        counts = torch.tensor(11.0)
+        mixed = loss_config_from_spec(
+            self._spec(
+                (0.7, {"loss_type": "cross_entropy"}),
+                (0.3, self._spec((2.0, {"loss_type": "cross_entropy", "name": "ce2"}))),
+            )
+        ).build()
+        loss, metrics = mixed(logits, labels, counts)
+        loss.backward()
+        mixed_grad = logits.grad.clone()
+
+        logits.grad = None
+        ce = F.cross_entropy(logits, labels, reduction="sum") / counts
+        expected = 0.7 * ce + 0.3 * 2.0 * ce
+        expected.backward()
+
+        torch.testing.assert_close(loss, expected)
+        torch.testing.assert_close(mixed_grad, logits.grad)
+        self.assertEqual(
+            set(metrics), {"cross_entropy/mean", "mixed/mean", "mixed/ce2/mean"}
+        )
+        torch.testing.assert_close(metrics["cross_entropy/mean"], ce.detach())
+        torch.testing.assert_close(metrics["mixed/ce2/mean"], ce.detach())
+        torch.testing.assert_close(metrics["mixed/mean"], 2.0 * ce.detach())
+
+    def test_inside_chunked_wrapper_matches_unchunked(self):
+        torch.manual_seed(0)
+        T, D, V = 24, 6, 13
+        model = _FakeDecoder(D, V)
+        hidden = torch.randn(T, D, requires_grad=True)
+        labels = torch.randint(0, V, (T,))
+        counts = torch.tensor(float(T))
+        spec = self._spec(
+            (1.0, {"loss_type": "cross_entropy"}),
+            (0.25, {"loss_type": "cross_entropy", "name": "aux"}),
+        )
+        chunked = ChunkedLossWrapper(
+            ChunkedLossWrapper.Config(num_chunks=4, loss_fn=loss_config_from_spec(spec))
+        )
+        chunked.lm_head = model.output
+        loss, metrics = chunked(hidden, labels, counts)
+        loss.backward()
+        hidden_grad, head_grad = hidden.grad.clone(), model.output.weight.grad.clone()
+
+        hidden.grad = None
+        model.output.weight.grad = None
+        ce = F.cross_entropy(model.output(hidden), labels, reduction="sum") / counts
+        (1.25 * ce).backward()
+
+        torch.testing.assert_close(loss, 1.25 * ce.detach())
+        torch.testing.assert_close(hidden_grad, hidden.grad)
+        torch.testing.assert_close(head_grad, model.output.weight.grad)
+        # Chunk metrics sum to the full-sequence unweighted values.
+        torch.testing.assert_close(metrics["cross_entropy/mean"], ce.detach())
+        torch.testing.assert_close(metrics["aux/mean"], ce.detach())
+
+
+class TestBitsPerByte(unittest.TestCase):
+    def test_bits_per_byte_in_mixed_loss(self):
+        torch.manual_seed(0)
+        logits = torch.randn(10, 7)
+        labels = torch.randint(0, 7, (10,))
+        config = loss_config_from_spec(
+            {
+                "loss_type": "mixed",
+                "losses": [
+                    {"weight": 1.0, "loss": {"loss_type": "cross_entropy", "name": "loss"}},
+                    {"weight": 1.0, "loss": {"loss_type": "bits_per_byte", "name": "bpb"}},
+                ],
+            }
+        )
+        self.assertTrue(uses_byte_normalizer(config))
+        self.assertFalse(uses_byte_normalizer(config.losses[0].loss))
+        _, metrics = config.build()(logits, labels)
+        nats = F.cross_entropy(logits, labels, reduction="sum")
+        self.assertEqual(set(metrics), {"loss/mean", "bpb/per_byte"})
+        torch.testing.assert_close(metrics["bpb/per_byte"], nats / math.log(2))
+
+    def test_bits_per_byte_rejects_training_normalization(self):
+        loss = loss_config_from_spec({"loss_type": "bits_per_byte"}).build()
+        with self.assertRaisesRegex(ValueError, "validator.losses"):
+            loss(torch.randn(4, 5), torch.randint(0, 5, (4,)), torch.tensor(4.0))
+
+    def test_validator_counts_label_bytes_and_normalizes(self):
+        from torchtitan.components.validator import Validator
+
+        validator = object.__new__(Validator)
+        validator._token_byte_lengths = torch.tensor([0, 1, 3, 4])
+        validator.parallelism_context = SimpleNamespace(dp_cp_enabled=False)
+        labels = torch.tensor([1, 2, IGNORE_INDEX, 3, 0])
+        self.assertEqual(int(validator._count_label_bytes(labels)), 1 + 3 + 4 + 0)
+        reduced = validator._reduce_metrics(
+            {"bpb/per_byte": torch.tensor(16.0), "loss/mean": torch.tensor(8.0)},
+            num_global_valid_tokens=4,
+            num_global_label_bytes=8,
+        )
+        self.assertEqual(reduced, {"bpb": 2.0, "loss": 2.0})

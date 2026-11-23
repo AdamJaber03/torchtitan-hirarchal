@@ -4,10 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
+import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Generic, Literal, TypeAlias, TypeVar
+from typing import Any, ClassVar, Generic, Literal, TypeAlias, TypeVar
 
 import spmd_types as spmd
 import torch
@@ -33,9 +35,18 @@ LossInputT = TypeVar("LossInputT", contravariant=True)
 class Loss(Function[LossResult], Generic[LossInputT], ABC):
     """Callable loss contract used by trainers and loss wrappers."""
 
+    normalizer: ClassVar[Literal["tokens", "bytes"]] = "tokens"
+    """What a summed loss is divided by: valid label tokens (the trainer passes
+    their global count as ``global_loss_token_counts``), or the UTF-8 bytes the
+    labels cover (counted by the validator; see ``BitsPerByteLoss``)."""
+
     @dataclass(kw_only=True, slots=True)
     class Config(Function.Config):
         """Base configuration type for loss components."""
+
+        name: str | None = None
+        """Label this loss reports under (inside a ``MixedLoss`` or as a named
+        validation loss). Defaults to its ``loss_type`` in ``LOSS_TYPES``."""
 
     @abstractmethod
     def __call__(
@@ -361,6 +372,173 @@ class MSELoss(Loss[torch.Tensor]):
         if global_loss_token_counts is not None:
             loss = loss / global_loss_token_counts
         return loss, {}
+
+
+def combine_loss_metrics(
+    current: dict[str, torch.Tensor],
+    values: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Merge one loss call's metrics into ``current`` (in place) and return it.
+
+    Mean/fraction metrics must already be normalized by the global valid-token
+    count, so summing the contributions of sequence chunks, microbatches and
+    ranks gives the global value. Keys ending in ``/max`` or ``/min`` take the
+    max or min. Any other suffix is rejected because its reduction is unknown.
+    """
+    for key, value in values.items():
+        previous = current.get(key)
+        if previous is None:
+            current[key] = value
+        elif key.endswith(("/mean", "/frac", "_mean", "_frac", "/per_byte")):
+            current[key] = previous + value
+        elif key.endswith("/max"):
+            current[key] = torch.maximum(previous, value)
+        elif key.endswith("/min"):
+            current[key] = torch.minimum(previous, value)
+        else:
+            raise ValueError(
+                f"Do not know how to reduce metric '{key}'. "
+                "Use a /mean, /frac, _mean, _frac, /per_byte, /max, or /min suffix."
+            )
+    return current
+
+
+@dataclass(kw_only=True, slots=True)
+class WeightedLoss:
+    """One term of a ``MixedLoss``: ``weight * loss``."""
+
+    weight: float
+    loss: Loss.Config
+
+
+def loss_name(config: Loss.Config) -> str:
+    """The label a loss reports under: its ``name``, else its ``loss_type``."""
+    if config.name is not None:
+        return config.name
+    for loss_type, loss_cls in LOSS_TYPES.items():
+        if type(config) is loss_cls.Config:
+            return loss_type
+    owner = type(config)._owner
+    return owner.__name__ if owner is not None else type(config).__qualname__
+
+
+class MixedLoss(Loss[LossInput]):
+    """Weighted sum of losses: ``sum_i weight_i * loss_i``. Itself a ``Loss``,
+    so mixes nest and can be used wherever a loss is expected.
+
+    Every term gets the same ``pred``, ``labels``, ``global_loss_token_counts``
+    and extra ``loss_inputs``. Metrics report each term's unweighted value as
+    ``<name>/mean`` (``<name>/per_byte`` for byte-normalized terms) and re-key the term's own metrics under ``<name>/``, so a
+    nested mix reports ``<outer>/<inner>/mean``.
+
+    Use it inside ``ChunkedLossWrapper`` (as its ``loss_fn``), never around it:
+    the wrapper runs backward per chunk, so weights applied outside it would
+    not reach the gradients.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Loss.Config):
+        losses: list[WeightedLoss]
+        """Weighted terms. Sibling names must be unique."""
+
+        def __post_init__(self):
+            if not self.losses:
+                raise ValueError("MixedLoss needs at least one loss term.")
+            names = []
+            for term in self.losses:
+                if not isinstance(term, WeightedLoss):
+                    raise TypeError(
+                        f"MixedLoss terms must be WeightedLoss, got {type(term).__name__}."
+                    )
+                if not math.isfinite(term.weight):
+                    raise ValueError(f"MixedLoss weight must be finite, got {term.weight}.")
+                if isinstance(term.loss, ChunkedLossWrapper.Config):
+                    raise ValueError(
+                        "ChunkedLossWrapper cannot be a MixedLoss term: it runs "
+                        "backward internally, so the weight would not apply. Put "
+                        "the MixedLoss inside ChunkedLossWrapper instead."
+                    )
+                names.append(loss_name(term.loss))
+            duplicates = sorted({n for n in names if names.count(n) > 1})
+            if duplicates:
+                raise ValueError(
+                    f"MixedLoss term names must be unique; repeated: {duplicates}. "
+                    "Set a distinct 'name' on each."
+                )
+
+    def __init__(self, config: Config):
+        self.terms: list[tuple[str, float, Callable[..., LossResult]]] = [
+            (loss_name(term.loss), term.weight, term.loss.build())
+            for term in config.losses
+        ]
+
+    def __call__(
+        self,
+        pred: LossInput,
+        labels: LossInput,
+        global_loss_token_counts: torch.Tensor | None = None,
+        **loss_inputs: Any,
+    ) -> LossResult:
+        total: torch.Tensor | None = None
+        metrics: dict[str, torch.Tensor] = {}
+        for name, weight, loss_fn in self.terms:
+            loss, term_metrics = loss_fn(
+                pred, labels, global_loss_token_counts, **loss_inputs
+            )
+            weighted = loss * weight
+            total = weighted if total is None else total + weighted
+            suffix = "per_byte" if loss_fn.normalizer == "bytes" else "mean"
+            metrics[f"{name}/{suffix}"] = loss.detach()
+            for key, value in term_metrics.items():
+                metrics[f"{name}/{key}"] = value
+        assert total is not None
+        return total, metrics
+
+
+class BitsPerByteLoss(Loss[torch.Tensor]):
+    """Cross-entropy in bits, to be divided by the UTF-8 bytes of the text the
+    labels cover: exact bits per byte, comparable across tokenizers.
+
+    The loss returns the summed bits; the validator divides by the byte count
+    it reads off the labels with ``BaseTokenizer.token_byte_lengths``. Only
+    for validation (``validator.losses``): training normalizes by tokens.
+    """
+
+    normalizer = "bytes"
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Loss.Config):
+        global_vocab_size: int | None = None
+        """Full vocabulary size, needed for spmd_types loss-parallel CE."""
+
+    def __init__(self, config: Config):
+        self.global_vocab_size = config.global_vocab_size
+
+    def __call__(
+        self,
+        pred: torch.Tensor,
+        labels: torch.Tensor,
+        global_loss_token_counts: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> LossResult:
+        del kwargs
+        if global_loss_token_counts is not None:
+            raise ValueError(
+                "bits_per_byte is normalized by text bytes, which only the "
+                "validator counts; use it in validator.losses, not for training."
+            )
+        nats = cross_entropy_loss(
+            pred, labels, global_vocab_size=self.global_vocab_size
+        )
+        return nats / math.log(2), {}
+
+
+def uses_byte_normalizer(config: Loss.Config) -> bool:
+    """Whether a loss config, or any term of a mixed one, is byte-normalized."""
+    if isinstance(config, MixedLoss.Config):
+        return any(uses_byte_normalizer(term.loss) for term in config.losses)
+    owner = type(config)._owner
+    return owner is not None and getattr(owner, "normalizer", "tokens") == "bytes"
 
 
 class _VocabParallelEntropy(torch.autograd.Function):
@@ -862,27 +1040,10 @@ class ChunkedLossWrapper(Loss[LossInput]):
     ) -> dict[str, torch.Tensor]:
         """Combine metrics from one sequence chunk into the local accumulator.
 
-        Mean/fraction metrics are expected to already be normalized by the
-        global valid-token count, so summing chunk contributions gives the
-        global mean for this rank's microbatch contribution. The trainer still
-        performs the cross-rank loss-mesh reduction on the returned metrics.
+        See ``combine_loss_metrics``. The trainer still performs the cross-rank
+        loss-mesh reduction on the returned metrics.
         """
-        for key, value in values.items():
-            previous = current.get(key)
-            if previous is None:
-                current[key] = value
-            elif key.endswith(("/mean", "/frac", "_mean", "_frac")):
-                current[key] = previous + value
-            elif key.endswith("/max"):
-                current[key] = torch.maximum(previous, value)
-            elif key.endswith("/min"):
-                current[key] = torch.minimum(previous, value)
-            else:
-                raise ValueError(
-                    f"Do not know how to reduce metric '{key}'. "
-                    "Use a /mean, /frac, _mean, _frac, /max, or /min suffix."
-                )
-        return current
+        return combine_loss_metrics(current, values)
 
     def _gradient_backprop(
         self,
@@ -903,3 +1064,82 @@ class ChunkedLossWrapper(Loss[LossInput]):
             *accumulated_grads,
             total_loss,
         )
+
+
+# Loss types that recipes can name in a loss spec. ChunkedLossWrapper is not
+# here: it is the outer wrapper that owns the lm_head, not a composable term.
+LOSS_TYPES: dict[str, type[Loss]] = {
+    "cross_entropy": CrossEntropyLoss,
+    "mse": MSELoss,
+    "mixed": MixedLoss,
+    "bits_per_byte": BitsPerByteLoss,
+}
+
+
+def loss_config_from_spec(spec: Mapping[str, Any], *, path: str = "loss") -> Loss.Config:
+    """Build a loss config from a dict spec: ``{"loss_type": <LOSS_TYPES key>,
+    <config fields>...}``. Unknown or missing fields raise.
+
+    A ``"mixed"`` spec lists its terms as ``{"weight": float, "loss": <spec>}``,
+    recursively::
+
+        {"loss_type": "mixed", "losses": [
+            {"weight": 1.0, "loss": {"loss_type": "cross_entropy"}},
+            {"weight": 0.1, "loss": {"loss_type": "mse", "name": "aux"}},
+        ]}
+    """
+    if not isinstance(spec, Mapping):
+        raise TypeError(f"{path}: a loss spec must be a dict, got {type(spec).__name__}.")
+    fields_spec = dict(spec)
+    loss_type = fields_spec.pop("loss_type", None)
+    if loss_type not in LOSS_TYPES:
+        problem = "is missing 'loss_type'" if loss_type is None else f"has unknown loss_type {loss_type!r}"
+        raise ValueError(f"{path} {problem}; known types: {sorted(LOSS_TYPES)}.")
+    config_cls = LOSS_TYPES[loss_type].Config
+    allowed = {
+        f.name: f
+        for f in dataclasses.fields(config_cls)
+        if f.init and not f.name.startswith("_")
+    }
+    unknown = sorted(set(fields_spec) - set(allowed))
+    if unknown:
+        raise ValueError(
+            f"{path} ({loss_type!r}) has unknown fields {unknown}; "
+            f"allowed: {sorted(allowed)}."
+        )
+    missing = sorted(
+        name
+        for name, f in allowed.items()
+        if name not in fields_spec
+        and f.default is dataclasses.MISSING
+        and f.default_factory is dataclasses.MISSING
+    )
+    if missing:
+        raise ValueError(f"{path} ({loss_type!r}) is missing required fields {missing}.")
+    if config_cls is MixedLoss.Config:
+        terms = fields_spec["losses"]
+        if not isinstance(terms, (list, tuple)):
+            raise TypeError(f"{path}.losses must be a list of {{'weight', 'loss'}} dicts.")
+        fields_spec["losses"] = [
+            _weighted_loss_from_spec(term, path=f"{path}.losses[{i}]")
+            for i, term in enumerate(terms)
+        ]
+    return config_cls(**fields_spec)
+
+
+def _weighted_loss_from_spec(spec: Any, *, path: str) -> WeightedLoss:
+    if not isinstance(spec, Mapping):
+        raise TypeError(f"{path}: a mixed-loss term must be a dict, got {type(spec).__name__}.")
+    keys = set(spec)
+    if keys != {"weight", "loss"}:
+        raise ValueError(
+            f"{path} must have exactly the keys ['loss', 'weight']; "
+            f"missing {sorted({'weight', 'loss'} - keys)}, unknown {sorted(keys - {'weight', 'loss'})}."
+        )
+    weight = spec["weight"]
+    if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+        raise TypeError(f"{path}.weight must be a number, got {weight!r}.")
+    return WeightedLoss(
+        weight=float(weight),
+        loss=loss_config_from_spec(spec["loss"], path=f"{path}.loss"),
+    )

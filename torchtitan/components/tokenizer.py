@@ -44,6 +44,15 @@ class BaseTokenizer(ABC, Configurable):
     def get_vocab_size(self) -> int:
         ...
 
+    def token_byte_lengths(self) -> list[int]:
+        """UTF-8 byte length of the text each token id stands for, indexed by
+        id (0 for special tokens such as EOS). Summed over a document's labels,
+        it gives the exact number of text bytes the model predicts, which is
+        the denominator of bits per byte."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not provide token byte lengths."
+        )
+
     def set_chat_template(self, template: str) -> None:
         """Compile and store a Jinja chat template."""
         import json
@@ -503,6 +512,40 @@ class HuggingFaceTokenizer(BaseTokenizer):
         """Convert ID to token."""
         return self.tokenizer.id_to_token(token_id)
 
+    def token_byte_lengths(self) -> list[int]:
+        """Exact UTF-8 byte length of each token id, for byte-level BPE.
+
+        Read from the vocabulary, whose byte-level token strings map each
+        character to one raw byte (GPT-2's bytes_to_unicode). Decoding a token
+        on its own would not work: a token holding part of a multi-byte
+        character decodes to U+FFFD (3 bytes). Special added tokens count 0
+        bytes; other added tokens count the bytes of their text.
+        """
+        decoder = type(self.tokenizer.decoder).__name__
+        if decoder != "ByteLevel":
+            raise NotImplementedError(
+                "token_byte_lengths needs a byte-level BPE tokenizer; this "
+                f"tokenizer's decoder is {decoder}."
+            )
+        byte_of_char = _byte_level_char_to_byte()
+        added = self.tokenizer.get_added_tokens_decoder()
+        vocab = self.tokenizer.get_vocab(with_added_tokens=True)
+        lengths = [0] * (max(vocab.values()) + 1)
+        for token, token_id in vocab.items():
+            if token_id in added:
+                added_token = added[token_id]
+                lengths[token_id] = (
+                    0 if added_token.special else len(added_token.content.encode())
+                )
+                continue
+            try:
+                lengths[token_id] = len(bytes(byte_of_char[char] for char in token))
+            except KeyError as error:
+                raise ValueError(
+                    f"Token {token!r} (id {token_id}) is not a byte-level string."
+                ) from error
+        return lengths
+
 
 class ByteTokenizer(BaseTokenizer):
     """UTF-8 byte tokenizer: one token per byte, vocabulary of 256.
@@ -542,6 +585,28 @@ class ByteTokenizer(BaseTokenizer):
 
     def get_vocab_size(self) -> int:
         return self.vocab_size
+
+    def token_byte_lengths(self) -> list[int]:
+        """Every token is one byte, except EOS (0xFF), which is no text."""
+        return [0 if token_id == self.eos_id else 1 for token_id in range(256)]
+
+
+def _byte_level_char_to_byte() -> dict[str, int]:
+    """Inverse of GPT-2's ``bytes_to_unicode``: the printable character that
+    byte-level BPE uses for each of the 256 byte values."""
+    printable = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
+    )
+    byte_values, chars = printable[:], printable[:]
+    extra = 0
+    for byte in range(256):
+        if byte not in printable:
+            byte_values.append(byte)
+            chars.append(256 + extra)
+            extra += 1
+    return {chr(char): byte for byte, char in zip(byte_values, chars)}
 
 
 class MultiModalTokenizer(HuggingFaceTokenizer):
