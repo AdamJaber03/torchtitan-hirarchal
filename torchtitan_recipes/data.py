@@ -8,15 +8,12 @@
 
 import dataclasses
 import glob
-import hashlib
 import logging
 import os
 from dataclasses import dataclass
-from functools import partial
-from typing import Any, Literal
+from typing import Literal
 
 import grain.python as grain
-import numpy as np
 
 from torchtitan.components.data import (
     DatasetIterationPolicy,
@@ -61,26 +58,6 @@ def with_augmentations(
     return dataclasses.replace(dataset, processor=processor)
 
 
-# FineWeb-Edu validation split: 1 in 30 documents by content hash (~1M of the
-# 30M local documents). Changing either constant changes the split.
-_FINEWEB_EDU_SPLIT_KEY = b"torchtitan-fineweb-edu-split-v1"
-_FINEWEB_EDU_VALIDATION_MODULUS = 30
-# Fixed seed for the file order, so a run does not walk through the source's
-# crawl dumps in sequence.
-_FINEWEB_EDU_FILE_ORDER_SEED = 20251103
-
-
-def _is_fineweb_edu_validation(row: dict[str, Any]) -> bool:
-    digest = hashlib.blake2b(
-        row["text"].encode("utf-8"), digest_size=8, key=_FINEWEB_EDU_SPLIT_KEY
-    ).digest()
-    return int.from_bytes(digest, "little") % _FINEWEB_EDU_VALIDATION_MODULUS == 0
-
-
-def _in_split(row: dict[str, Any], *, validation: bool) -> bool:
-    return _is_fineweb_edu_validation(row) == validation
-
-
 @dataclass(frozen=True)
 class _FileShardedStreamingSource:
     """Streaming source that requires whole files per DP rank.
@@ -119,28 +96,29 @@ class _FileShardedStream:
 def local_fineweb_edu(
     data_dir: str, *, split: Literal["train", "validation"]
 ) -> SingleDatasetConfig:
-    """FineWeb-Edu from local ``chunk_*.jsonl`` files (rows with a "text" field).
+    """FineWeb-Edu from ``<data_dir>/<split>/part-*.parquet`` (a "text" column).
 
-    Train and validation read every file and split documents by a content hash
-    (see ``_FINEWEB_EDU_VALIDATION_MODULUS``), so both follow the same
-    distribution, duplicates never cross the split, and the split is the same
-    for every run, seed and DP degree.
+    The files come pre-split and pre-shuffled (see BUILD.md next to the data):
+    validation is 1 in 30 documents by a keyed content hash of the text, and
+    documents are spread over the files in a fixed random order, so every file
+    follows the same distribution. Only the "text" column is read.
     """
-    paths = sorted(glob.glob(os.path.join(data_dir, "chunk_*.jsonl")))
+    split_dir = os.path.join(data_dir, split)
+    paths = sorted(glob.glob(os.path.join(split_dir, "part-*.parquet")))
     if not paths:
-        raise FileNotFoundError(f"no chunk_*.jsonl files in {data_dir!r}")
-    order = np.random.default_rng(_FINEWEB_EDU_FILE_ORDER_SEED).permutation(len(paths))
-    paths = [paths[i] for i in order]
+        raise FileNotFoundError(f"no part-*.parquet files in {split_dir!r}")
     return SingleDatasetConfig(
         source=_FileShardedStreamingSource(
             source=HuggingFaceStreamingSource.Config(
-                path="json",
+                path="parquet",
                 split="train",
-                load_dataset_kwargs={"data_files": {"train": paths}},
+                load_dataset_kwargs={
+                    "data_files": {"train": paths},
+                    "columns": ["text"],
+                },
             ),
             num_files=len(paths),
         ),
-        pre_filters=(partial(_in_split, validation=split == "validation"),),
         processor=TextProcessor.Config(),
         post_filters=(lambda sample: sample is not None,),
     )

@@ -17,11 +17,11 @@ Usage:
 """
 
 import argparse
-import json
 import math
 
 import numpy as np
 import torch
+import pyarrow.parquet as pq
 from datasets import load_dataset
 
 from torchtitan.components.tokenizer import ByteTokenizer, HuggingFaceTokenizer
@@ -32,13 +32,8 @@ from torchtitan_recipes.data import local_fineweb_edu
 def _fineweb_edu_validation(data_dir: str):
     """Validation documents in the order the training recipes read files."""
     dataset = local_fineweb_edu(data_dir, split="validation")
-    (in_split,) = dataset.pre_filters
     for path in dataset.source.source.load_dataset_kwargs["data_files"]["train"]:
-        with open(path) as file:
-            for line in file:
-                row = json.loads(line)
-                if in_split(row):
-                    yield row
+        yield from pq.read_table(path, columns=["text"]).to_pylist()
 
 
 def _packed_rows(docs, *, row_len: int, max_context_length: int):
@@ -62,7 +57,7 @@ def main() -> None:
     parser.add_argument(
         "--fineweb_edu_dir",
         default=None,
-        help="Measure the FineWeb-Edu validation split of these chunk_*.jsonl "
+        help="Measure the FineWeb-Edu validation split under this directory "
         "files instead of C4 validation.",
     )
     parser.add_argument(

@@ -11,38 +11,33 @@ Usage:
 """
 
 import argparse
-import json
 import math
+import os
 from multiprocessing import Pool
+
+import pyarrow.parquet as pq
 
 from torchtitan.components.tokenizer import ByteTokenizer, HuggingFaceTokenizer
 from torchtitan_recipes.data import local_fineweb_edu
 
-_FINEWEB_EDU_DIR = "/home/adamga/leshemg/adamga/data/fineweb_translated/en-original"
+_FINEWEB_EDU_DIR = os.path.expanduser("~/data/fineweb-edu-ar-nizarun/en")
 _HF_ASSETS = "./assets/hf/Qwen3-0.6B"
 
 
 def _count(args) -> list[tuple[int, int, int]]:
     path, stride = args
-    (in_split,) = local_fineweb_edu(_FINEWEB_EDU_DIR, split="train").pre_filters
     qwen = HuggingFaceTokenizer(tokenizer_path=_HF_ASSETS)
     byte = ByteTokenizer()
     out = []
-    with open(path) as file:
-        for i, line in enumerate(file):
-            if i % stride:
-                continue
-            row = json.loads(line)
-            if not in_split(row):
-                continue
-            text = row["text"]
-            out.append(
-                (
-                    len(text.encode("utf-8")),
-                    len(qwen.encode(text, add_bos=True, add_eos=True)),
-                    len(byte.encode(text, add_bos=True, add_eos=True)),
-                )
+    texts = pq.read_table(path, columns=["text"]).column("text").to_pylist()
+    for text in texts[::stride]:
+        out.append(
+            (
+                len(text.encode("utf-8")),
+                len(qwen.encode(text, add_bos=True, add_eos=True)),
+                len(byte.encode(text, add_bos=True, add_eos=True)),
             )
+        )
     return out
 
 
