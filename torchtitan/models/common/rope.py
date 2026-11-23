@@ -18,6 +18,7 @@ __all__ = [
     "ComplexRoPE",
     "CosSinRoPE",
     "RoPE",
+    "StaticShapeCosSinRoPE",
 ]
 
 
@@ -503,3 +504,32 @@ def _reshape_for_broadcast(
     else:
         rope_cache = rope_cache[positions]
     return rope_cache.view(num_tokens, 1, cache_width)
+
+
+class StaticShapeCosSinRoPE(CosSinRoPE):
+    """CosSinRoPE compiled with static shapes only.
+
+    A model that calls RoPE at two sequence lengths (SpaceByte: bytes in its
+    local layers, patches in its global layers) otherwise gets a dynamic-shape
+    graph next to the static one, and activation recompute can pick the other
+    graph than the forward did, which saves different tensors and fails with
+    torch.utils.checkpoint's "Recomputed values ... have different metadata"
+    (intermittently, at the first step). Static graphs, one per length, keep
+    forward and recompute on the same graph.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(CosSinRoPE.Config):
+        pass
+
+    @local_compile("rope", batch_invariant=True, dynamic=False)
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        *,
+        inverse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return RoPE.forward(self, query, key, positions, inverse=inverse)
+

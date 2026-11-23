@@ -185,21 +185,31 @@ _WARMUP_STEPS = 1000
 _QWEN3_TOKENS_PER_STEP = 32 * 16384  # 524,288: 16 microbatches per rank on 2 GPUs
 _STEPS = 19_073  # 10.0B Qwen3 tokens
 
-# SpaceByte trains on the same text bytes as Qwen3, step for step. On the train
-# files these runs read, a Qwen3 token is 4.67586 +- 0.00096 byte-stream tokens
-# (BOS/EOS included; scripts/qwen3_bytes_per_token.py), so one Qwen3 step is
-# 2,451,496 bytes. 19 microbatches of 64512 bytes per rank on 2 GPUs give
-# 2,451,456 per step, 0.002% fewer. Both read the same documents in the same
-# order, so they see the same text, up to the last few documents.
-_SPACEBYTE_BYTES_PER_MICROBATCH = 64512
-_SPACEBYTE_BYTES_PER_STEP = 38 * _SPACEBYTE_BYTES_PER_MICROBATCH
+# SpaceByte and Qwen3 are compute-matched and data-matched: the "0.6B-flops"
+# flavor costs the same training FLOPs per text byte as Qwen3-0.6B (see its
+# docstring; scripts/flops_per_byte.py), and each step reads the same text.
+# On the nizarun English train split a Qwen3 token is 4.695697 +- 0.000618
+# byte-stream tokens (EOS included; scripts/qwen3_bytes_per_token.py, all 960
+# files, 2026-11-23), so one Qwen3 step is 2,461,927 bytes. 64 microbatches of
+# 38,464 bytes give 2,461,696, 0.009% fewer, on up to 64 GPUs. With
+# _reduce_gradient_traffic and patch capacity 5.5, one L40S node: 88.8K bytes/s
+# per GPU at 16.6 GiB (capacity 5.0: 84.5K at 17 GiB;
+# 76,928-byte microbatches: 80K at 31 GiB; neither setting: 75K).
+_SPACEBYTE_FLAVOR = "0.6B-flops"
+_SPACEBYTE_BYTES_PER_MICROBATCH = 38_464
+_SPACEBYTE_BYTES_PER_STEP = 64 * _SPACEBYTE_BYTES_PER_MICROBATCH
 
 
 def spacebyte_0_6b_flex(
-    seq_len: int = 16384, local_lr_multiplier: float = 1.0
+    seq_len: int = 16384,
+    local_lr_multiplier: float = 1.0,
+    bytes_per_microbatch: int = _SPACEBYTE_BYTES_PER_MICROBATCH,
 ) -> Trainer.Config:
+    """``bytes_per_microbatch`` must divide the step over the DP ranks; the
+    default allows up to 64 GPUs."""
     config = spacebyte_0_6b(
         seq_len=seq_len,
+        flavor=_SPACEBYTE_FLAVOR,
         attn_backend="flex",
         lr=_LR,
         local_lr_multiplier=local_lr_multiplier,
@@ -216,13 +226,12 @@ def spacebyte_0_6b_flex(
     )
     config.training = dataclasses.replace(
         config.training,
-        num_tokens_per_microbatch_per_dp_rank=_SPACEBYTE_BYTES_PER_MICROBATCH,
+        num_tokens_per_microbatch_per_dp_rank=bytes_per_microbatch,
         num_tokens_per_train_step=_SPACEBYTE_BYTES_PER_STEP,
         steps=_STEPS,
     )
-    config.dataloader.max_num_documents = c4_document_capacity(
-        _SPACEBYTE_BYTES_PER_MICROBATCH
-    )
+    config.dataloader.max_num_documents = c4_document_capacity(bytes_per_microbatch)
+    _reduce_gradient_traffic(config)
     _use_fineweb_edu(config)
     num_tokens = config.training.num_tokens_per_microbatch_per_dp_rank
     config.validator = _validator(
@@ -240,6 +249,7 @@ _OUTPUT_ROOT = os.environ.get(
     "TORCHTITAN_OUTPUT_ROOT",
     os.path.expanduser("~/torchtitan_hirarchal_outputs"),
 )
+_SEED = 42
 _WANDB_ENTITY = "adam-gaber-weizmann-institute-of-science"
 _WANDB_PROJECT = "torchtitan-hirarchal"
 
@@ -273,6 +283,10 @@ def _named_run(
             f"multiples of the checkpoint interval {interval}."
         )
     config.dump_folder = f"{_OUTPUT_ROOT}/{run}"
+    # A fixed seed makes a launch repeatable (initial weights; GPU kernels are
+    # still not bit-deterministic). Resuming loads weights, so it has no effect
+    # on a run already started (run 3 began with a random seed).
+    config.debug = dataclasses.replace(config.debug, seed=_SEED)
     config.checkpointer = CheckpointManager.Config(
         folder=f"{_OUTPUT_ROOT}/checkpoints/{run}",
         interval=interval,
@@ -301,6 +315,19 @@ def spacebyte_0_6b_flex_local_lr_x2() -> Trainer.Config:
     return spacebyte_0_6b_flex(local_lr_multiplier=2.0)
 
 
+def _reduce_gradient_traffic(config: Trainer.Config) -> Trainer.Config:
+    """Less FSDP traffic over the L40S nodes' PCIe: weights stay gathered from
+    forward to backward, gradients are reduce-scattered once per step instead
+    of once per microbatch, and in bf16. Qwen3-0.6B, 16384-token microbatches,
+    1 node: 19.5K -> 22.2K-22.6K tokens/s per GPU for +2 GiB (benchmarked
+    2026-11-23). bf16 reduction alone is ~+6% but sums gradients across GPUs
+    in bf16 instead of fp32."""
+    config.parallelism.fsdp_reshard_after_forward = "never"
+    config.parallelism.fsdp_defer_gradient_reduction = True
+    config.training.mixed_precision_reduce = "bfloat16"
+    return config
+
+
 def qwen3_0_6b_flex_baseline(seq_len: int = 4096) -> Trainer.Config:
     """Qwen3-0.6B with the same schedule and validation as SpaceByte, and its
     single learning rate equal to SpaceByte's global-layer learning rate."""
@@ -319,6 +346,7 @@ def qwen3_0_6b_flex_baseline(seq_len: int = 4096) -> Trainer.Config:
         max_context_length=config.training.max_context_length,
     )
     config.activation_remat = FullActivationRematConfig()
+    _reduce_gradient_traffic(config)
     _use_fineweb_edu(config)
     num_tokens = config.training.num_tokens_per_microbatch_per_dp_rank
     validation_tokens = _VALIDATION_BYTES_PER_RANK * QWEN3_LABELS_PER_TEXT_BYTE
@@ -367,10 +395,11 @@ def qwen3_0_6b_fineweb_edu_nizarun_run() -> Trainer.Config:
 def spacebyte_0_6b_fineweb_edu_run() -> Trainer.Config:
     return _named_run(
         spacebyte_0_6b_flex(),
-        run_id=2,
-        name="spacebyte-0.6b_fineweb-edu",
-        # Saves matmul outputs, recomputes the rest: 64.2K bytes/s per L40S at
-        # 34 GiB (full: 56.1K, 8 GiB). Without remat it runs out of memory.
+        # Run 2 was the old 14+14-layer flavor on the old data and cluster.
+        run_id=4,
+        name="spacebyte-0.6b-flops_fineweb-edu-nizarun",
+        # Old 14+14-layer flavor, 64512-byte microbatches: 64.2K bytes/s per
+        # L40S at 34 GiB (full remat: 56.1K, 8 GiB); no remat ran out of memory.
         activation_remat=DefaultActivationRematConfig(),
         persistent_checkpoint_steps=_PERSISTENT_CHECKPOINT_STEPS,
     )
@@ -497,9 +526,8 @@ def qwen3_0_6b_fineweb_edu_bench() -> Trainer.Config:
     config.validator = None
     config.metrics = MetricsProcessor.Config(log_freq=5)
     config.dump_folder = "./outputs/bench_qwen3"
-    config.checkpointer = CheckpointManager.Config(
-        folder="./outputs/bench_qwen3/checkpoint", interval=10**9
-    )
+    # No checkpoints: a final save would make the next bench resume from it.
+    config.checkpointer = None
     return config
 
 
@@ -523,3 +551,24 @@ def spacebyte_0_6b_flex_profile() -> Trainer.Config:
 
 def qwen3_0_6b_flex_baseline_profile() -> Trainer.Config:
     return _profile(qwen3_0_6b_flex_baseline(), "qwen3")
+
+
+def _spacebyte_bench(bytes_per_microbatch: int, name: str) -> Trainer.Config:
+    """Throughput of spacebyte_0_6b_fineweb_edu_run over 30 steps, without
+    validation, W&B or checkpoints."""
+    config = spacebyte_0_6b_fineweb_edu_run()
+    if bytes_per_microbatch != config.training.num_tokens_per_microbatch_per_dp_rank:
+        config.training.num_tokens_per_microbatch_per_dp_rank = bytes_per_microbatch
+        config.dataloader.max_num_documents = c4_document_capacity(bytes_per_microbatch)
+    config.training.steps = 30
+    config.validator = None
+    config.metrics = MetricsProcessor.Config(log_freq=5)
+    config.dump_folder = f"./outputs/{name}"
+    config.checkpointer = None
+    return config
+
+
+def spacebyte_0_6b_fineweb_edu_bench() -> Trainer.Config:
+    return _spacebyte_bench(_SPACEBYTE_BYTES_PER_MICROBATCH, "bench_spacebyte")
+
+

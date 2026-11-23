@@ -18,7 +18,12 @@ import torch.nn as nn
 
 from torchtitan.components.tokenizer import ByteTokenizer
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.models.common import CosSinRoPE, Embedding, Linear, TransformerBlock
+from torchtitan.models.common import (
+    Embedding,
+    Linear,
+    StaticShapeCosSinRoPE,
+    TransformerBlock,
+)
 from torchtitan.models.common.attention import (
     FlexInnerAttention,
     InnerAttention,
@@ -60,6 +65,11 @@ _ROPE_THETA = 1000000.0
 #                global slot and 14% of slots as padding.
 #   FineWeb-Edu: 6.07 bytes per patch; 0.003% of bytes, 18% padding.
 _C4_CAPACITY_BYTES_PER_PATCH = 5.0
+# nizarun English train, 38,464-byte microbatches (scripts/spacebyte_capacity.py,
+# 374K microbatches): 6.067 bytes per patch; 5.5 leaves 0.004% of bytes without
+# a global slot (0.16% of microbatches overflow) and 10% of slots as padding,
+# vs 0.00015% and 19% at 5.0.
+_NIZARUN_CAPACITY_BYTES_PER_PATCH = 5.5
 
 
 def _norm(dim: int, *, sharding_config=None) -> RMSNorm.Config:
@@ -102,7 +112,9 @@ def _build_layers(
 ) -> list[TransformerBlock.Config]:
     """Dense Qwen3 blocks, as in ``qwen3/flavors.py``."""
     norm_sharding = norm_sharding_config(enable_sp=enable_sp)
-    rope = CosSinRoPE.Config(
+    # Static-shape compile: RoPE runs at two lengths (bytes, patches); see
+    # StaticShapeCosSinRoPE.
+    rope = StaticShapeCosSinRoPE.Config(
         dim=head_dim, max_context_length=max_context_length, theta=_ROPE_THETA
     )
     return [
@@ -152,6 +164,7 @@ def _spacebyte(
     attn_backend: str,
     seq_len: int,
     parallelism: ParallelismConfig,
+    capacity_tokens_per_patch: float = _C4_CAPACITY_BYTES_PER_PATCH,
 ) -> SpaceByteModel.Config:
     """One-level SpaceByte: local byte layers around global patch layers."""
     enable_sp = parallelism.enable_sequence_parallel
@@ -211,7 +224,7 @@ def _spacebyte(
                 num_decoder_layers=num_decoder_layers,
                 inner_dim=global_dim,
                 boundary=SpacelikeBoundary.Config(),
-                capacity_tokens_per_patch=_C4_CAPACITY_BYTES_PER_PATCH,
+                capacity_tokens_per_patch=capacity_tokens_per_patch,
             )
         ],
     )
@@ -266,9 +279,46 @@ def _0_6b(
     )
 
 
+def _0_6b_flops(
+    attn_backend: str, *, seq_len: int, parallelism: ParallelismConfig
+) -> SpaceByteModel.Config:
+    """"0.6B" with the same training FLOPs per text byte as Qwen3-0.6B.
+
+    Counted algorithmically (scripts/flops_per_byte.py): 3 x forward, forward =
+    2 x matmul multiply-accumulates plus QK^T and AV over the pairs the masks
+    allow; no norms, elementwise ops, padding slots or kernel tile waste. On the
+    nizarun English train split (6.064 bytes per patch, 0.21309 Qwen3 tokens per
+    byte) Qwen3-0.6B costs 893.5 MFLOP per text byte and "0.6B" 1.2533x that.
+    The global blocks stay Qwen3-0.6B's; the local stacks shrink from 14+14 to
+    9+9 layers, and the window from 512 to 432 bytes absorbs the remainder:
+    1.00008x Qwen3. Re-measure when the data changes.
+    """
+    return _spacebyte(
+        local_dim=512,
+        local_n_heads=4,
+        local_n_kv_heads=2,
+        local_head_dim=128,
+        local_hidden_dim=1536,
+        local_window=432,
+        num_encoder_layers=9,
+        num_decoder_layers=9,
+        global_dim=1024,
+        global_n_heads=16,
+        global_n_kv_heads=8,
+        global_head_dim=128,
+        global_hidden_dim=3072,
+        num_global_layers=28,
+        attn_backend=attn_backend,
+        seq_len=seq_len,
+        parallelism=parallelism,
+        capacity_tokens_per_patch=_NIZARUN_CAPACITY_BYTES_PER_PATCH,
+    )
+
+
 MODEL_FLAVORS = {
     "debugmodel": (_debugmodel, 2048),
     "0.6B": (_0_6b, 16384),
+    "0.6B-flops": (_0_6b_flops, 16384),
 }
 
 

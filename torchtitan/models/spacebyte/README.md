@@ -89,6 +89,34 @@ Per byte, SpaceByte costs about 15% more FLOPs than Qwen3-0.6B. For a
 compute-matched comparison (the paper's setup), give both runs the same
 training FLOPs, not the same bytes.
 
+### `0.6B-flops`: compute-matched flavor
+
+`my_recipes.py` trains `0.6B-flops`, which costs the same training FLOPs per
+text byte as Qwen3-0.6B, so equal text also means equal total compute. FLOPs
+are counted algorithmically by `scripts/flops_per_byte.py`:
+- training = 3 x forward;
+- forward = 2 x the multiply-accumulates of every matmul, plus QK^T and AV
+  over the (query, key) pairs the masks allow;
+- norms, elementwise ops, padding slots and kernel tile waste are ignored.
+
+On the nizarun English train split (0.21309 Qwen3 tokens and 0.16490 patches
+per text byte):
+
+| | Qwen3-0.6B | SpaceByte `0.6B` | SpaceByte `0.6B-flops` |
+|---|---|---|---|
+| Local layers | - | 14 + 14, window 512 | 9 + 9, window 432 |
+| MFLOP per text byte | 893.5 | 1119.9 (1.2533x) | 893.6 (1.00008x) |
+
+The global blocks are unchanged, still Qwen3-0.6B's. Re-measure when the data
+changes.
+
+`0.6B-flops` also uses patch capacity 5.5 instead of 5.0. On 38,464-byte
+microbatches of this data, 0.004% of bytes lose their global slot and 10% of
+slots are padding, against 19% at 5.0: about 5% faster
+(`scripts/spacebyte_capacity.py`). Its RoPE uses `StaticShapeCosSinRoPE`; with
+the dynamic-shape compile, activation recompute crashed at startup on some
+launches.
+
 Everything else is Qwen3: RMSNorm with eps 1e-6, QK-norm, CosSinRoPE with theta
 1e6, SwiGLU, and std-0.02 init. Deliberate differences from the reference
 implementation, made to keep Qwen3 as the only other variable:
