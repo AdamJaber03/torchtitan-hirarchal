@@ -37,9 +37,11 @@ export PYTORCH_ALLOC_CONF="expandable_segments:True"
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export PYTHONFAULTHANDLER=1
-# Log to W&B online only when logged in (wandb login writes ~/.netrc);
-# otherwise keep the run offline and sync it later with `wandb sync`.
-if [[ -z "${WANDB_API_KEY:-}" ]] && ! grep -qs api.wandb.ai ~/.netrc; then
+# Log to W&B online only when logged in; otherwise keep the run offline and
+# sync it later with `wandb sync`. Ask wandb itself: `wandb login` stores the
+# key in ~/.netrc under the account's host, which need not be api.wandb.ai.
+if [[ -z "${WANDB_API_KEY:-}" ]] && ! .venv/bin/python -c \
+    "import sys, wandb; sys.exit(0 if wandb.Api().api_key else 1)" 2>/dev/null; then
     echo "W&B: no credentials found, logging offline" >&2
     export WANDB_MODE=${WANDB_MODE:-offline}
 fi

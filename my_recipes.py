@@ -392,6 +392,21 @@ def qwen3_0_6b_fineweb_edu_nizarun_run() -> Trainer.Config:
     )
 
 
+
+def qwen3_0_6b_fineweb_edu_nizarun_seed42_run() -> Trainer.Config:
+    """The Qwen3 side of the compute-matched pair with run 4 (SpaceByte):
+    fixed seed, _reduce_gradient_traffic, and 16384-token microbatches (one per
+    GPU on 4 nodes; up to 32 GPUs). Run 3 started before these and can only
+    resume on 8 nodes."""
+    config = qwen3_0_6b_flex_baseline()
+    return _named_run(
+        config,
+        run_id=5,
+        name="qwen3-0.6b_fineweb-edu-nizarun-seed42",
+        activation_remat=None,
+        persistent_checkpoint_steps=_PERSISTENT_CHECKPOINT_STEPS,
+    )
+
 def spacebyte_0_6b_fineweb_edu_run() -> Trainer.Config:
     return _named_run(
         spacebyte_0_6b_flex(),
