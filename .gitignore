@@ -51,3 +51,7 @@ CLAUDE_CONTEXT/
 
 # Lychee (link checker) cache
 .lycheecache
+
+# SLURM job logs (slurm/train.sh, slurm/queue.sh)
+slurm-*.out
+/logs/
