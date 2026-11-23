@@ -1,7 +1,8 @@
-"""Local recipes for the mcluster11 RTX PRO 6000 (SM120) nodes.
+"""Recipes for the Qwen3-0.6B vs SpaceByte-0.6B runs (GOLEM L40S nodes; first
+written for the mcluster11 RTX PRO 6000 nodes). Launch with slurm/train.sh.
 
 The default ``varlen`` attention backend dispatches to FA4, which PyTorch only
-allows on SM 9.x/10.x, so these recipes select the ``flex`` backend instead.
+allows on SM 9.x/10.x (L40S is SM 8.9), so these recipes select ``flex``.
 
 ``spacebyte_0_6b_flex`` and ``qwen3_0_6b_flex_baseline`` share optimizer,
 schedule and validation settings, so their runs differ only in the model (and
@@ -11,6 +12,7 @@ its tokenizer). Compare validation bits per byte:
 """
 
 import dataclasses
+import os
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import (
@@ -19,6 +21,7 @@ from torchtitan.components.data import (
     TextAugmentation,
     TokenAugmentation,
 )
+from torchtitan.components.loss import ChunkedLossWrapper, loss_config_from_spec
 from torchtitan.components.optim import AdamW, OptimizersContainer
 from torchtitan.components.validator import Validator
 from torchtitan.config.function import CallableFunction
@@ -39,9 +42,10 @@ from torchtitan_recipes.data import (
 from torchtitan_recipes.models.spacebyte import spacebyte_0_6b
 from torchtitan_recipes.tests.models.qwen3 import qwen3_0_6b
 
-# English FineWeb-Edu, 1200 x 25k documents (see torchtitan_recipes/data.py
-# for the content-hash train/validation split).
-_FINEWEB_EDU_DIR = "/home/adamga/leshemg/adamga/data/fineweb_translated/en-original"
+# English FineWeb-Edu side of the paired en/ar set: train/ (960 files, 23,969,882
+# docs) and validation/ (192 files, 824,543 docs), pre-split and pre-shuffled.
+# The file counts divide evenly by DP degrees 8, 16, 24, 32 and 64.
+_FINEWEB_EDU_DIR = os.path.expanduser("~/data/fineweb-edu-ar-nizarun/en")
 
 # Training-data augmentations, applied in order by TextProcessor: text ones to
 # the raw text, token ones to the tokenized document. Validation stays clean.
@@ -52,15 +56,78 @@ TOKEN_AUGMENTATIONS: tuple[TokenAugmentation.Config, ...] = ()
 QWEN3_LABELS_PER_TEXT_BYTE = 0.21295  # 4.696 text bytes per Qwen3 token
 BYTE_LABELS_PER_TEXT_BYTE = 1.00020  # one EOS per document
 
-# The whole validation split: 998,183 documents (counted once over all files).
-_FULL_VALIDATION_TEXT_BYTES = 4_891_202_282
+# The whole validation split: 824,543 documents (counted once over all files).
+_FULL_VALIDATION_TEXT_BYTES = 3_967_216_214
 
 # Validation scores ~1.5M text bytes per DP rank for both models: the same
 # validation documents, in the same order.
 _VALIDATION_BYTES_PER_RANK = 24 * 65536
 
-# Mixes documents across about one source file (~70 MB of text per rank).
+# The files are already shuffled; this window only adds extra local mixing.
 _SHUFFLE_BUFFER_DOCS = 25_000
+
+
+def set_loss(config: Trainer.Config, spec: dict) -> Trainer.Config:
+    """Set the training loss from a dict spec (see loss_config_from_spec in
+    torchtitan/components/loss.py), e.g.::
+
+        set_loss(config, {"loss_type": "mixed", "losses": [
+            {"weight": 1.0, "loss": {"loss_type": "cross_entropy"}},
+            {"weight": 0.1, "loss": {"loss_type": "mse", "name": "aux"}},
+        ]})
+
+    The spec replaces the loss inside ChunkedLossWrapper, which keeps its
+    lm_head chunking. Each MixedLoss term is logged as loss_metrics/<name>.
+    For separate validation losses, set config.validator.losses to a list of
+    specs, each reported as validation_metrics/<name>.
+    """
+    loss = loss_config_from_spec(spec)
+    if isinstance(config.loss, ChunkedLossWrapper.Config):
+        config.loss = dataclasses.replace(config.loss, loss_fn=loss)
+    else:
+        config.loss = loss
+    return config
+
+
+def use_eos_as_bos(config: Trainer.Config) -> Trainer.Config:
+    """Start every training and validation document with the EOS token as a
+    BOS (TextProcessor.Config.eos_as_bos). Qwen3 and ByteTokenizer have no BOS,
+    so otherwise a document's first token is never predicted: about 3.7 bytes
+    per document for Qwen3 but 1 for SpaceByte, which slightly favors Qwen3 in
+    a BPB comparison. Changes the data format, so only for new runs, and use it
+    for both models of a comparison."""
+    loaders = [config.dataloader]
+    if config.validator is not None:
+        loaders.append(config.validator.dataloader)
+    for loader in loaders:
+        packing = loader.dataset
+        single = packing.dataset
+        loader.dataset = dataclasses.replace(
+            packing,
+            dataset=dataclasses.replace(
+                single,
+                processor=dataclasses.replace(single.processor, eos_as_bos=True),
+            ),
+        )
+    return config
+
+
+def _hsdp_for_launch(config: Trainer.Config) -> Trainer.Config:
+    """Multi-node launches use HSDP: FSDP within a node, replicas across nodes.
+
+    Weights are all-gathered over a node's PCIe GPUs only, and gradients cross
+    InfiniBand once per step. Reads torchrun's WORLD_SIZE / LOCAL_WORLD_SIZE,
+    so a single-node launch (or no launcher, e.g. --print-config) stays plain
+    FSDP. Mutates config.parallelism in place: the model config shares it.
+    """
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    local = int(os.environ.get("LOCAL_WORLD_SIZE", str(world)))
+    if world > local:
+        if world % local:
+            raise ValueError(f"WORLD_SIZE {world} is not a multiple of {local}.")
+        config.parallelism.data_parallel_replicate_degree = world // local
+        config.parallelism.data_parallel_shard_degree = local
+    return config
 
 
 def _use_fineweb_edu(config: Trainer.Config) -> Trainer.Config:
@@ -76,10 +143,22 @@ def _use_fineweb_edu(config: Trainer.Config) -> Trainer.Config:
     return config
 
 
+# Validation scores cross-entropy (kept under the name "loss", as before) and
+# exact bits per byte: summed bits over the UTF-8 bytes the labels cover, read
+# off the labels with the tokenizer's byte-length table. BPB is comparable
+# between Qwen3 and SpaceByte as is; with use_eos_as_bos both also predict
+# exactly the same bytes (every byte of every document).
+_VALIDATION_LOSSES = (
+    {"loss_type": "cross_entropy", "name": "loss"},
+    {"loss_type": "bits_per_byte", "name": "bpb"},
+)
+
+
 def _validator(num_tokens_per_microbatch: int, steps: int) -> Validator.Config:
     return Validator.Config(
         freq=500,
         steps=steps,
+        losses=[dict(spec) for spec in _VALIDATION_LOSSES],
         dataloader=GrainDataLoader.Config(
             max_num_documents=c4_document_capacity(num_tokens_per_microbatch),
             dataset=ConcatThenSplitPackingConfig(
@@ -149,6 +228,7 @@ def spacebyte_0_6b_flex(
     config.validator = _validator(
         num_tokens, steps=_VALIDATION_BYTES_PER_RANK // num_tokens
     )
+    _hsdp_for_launch(config)
     return config
 
 
@@ -156,7 +236,10 @@ def spacebyte_0_6b_flex(
 # and checkpoints to _OUTPUT_ROOT/checkpoints/<id>_<name>. Relaunching a run
 # resumes from its latest checkpoint and appends to the same W&B run, so give
 # a fresh run a new id rather than reusing one.
-_OUTPUT_ROOT = "/home/adamga/leshemg/adamga/torchtitan_hirarchal_outputs"
+_OUTPUT_ROOT = os.environ.get(
+    "TORCHTITAN_OUTPUT_ROOT",
+    os.path.expanduser("~/torchtitan_hirarchal_outputs"),
+)
 _WANDB_ENTITY = "adam-gaber-weizmann-institute-of-science"
 _WANDB_PROJECT = "torchtitan-hirarchal"
 
@@ -177,7 +260,7 @@ def _named_run(
 ) -> Trainer.Config:
     """``activation_remat`` replaces the base recipe's policy; it changes memory
     and speed, not numerics. ``persistent_checkpoint_steps`` are kept on top of
-    the latest 5; each must be a multiple of the checkpoint interval, or it is
+    the latest 3; each must be a multiple of the checkpoint interval, or it is
     never saved."""
     run = f"{run_id}_{name}"
     config.activation_remat = activation_remat
@@ -193,7 +276,7 @@ def _named_run(
     config.checkpointer = CheckpointManager.Config(
         folder=f"{_OUTPUT_ROOT}/checkpoints/{run}",
         interval=interval,
-        keep_latest_k=5,
+        keep_latest_k=3,
         purge_exempt=CallableFunction.Config(
             fn=frozenset(persistent_checkpoint_steps).__contains__
         ),
@@ -242,6 +325,7 @@ def qwen3_0_6b_flex_baseline(seq_len: int = 4096) -> Trainer.Config:
     config.validator = _validator(
         num_tokens, steps=max(1, round(validation_tokens / num_tokens))
     )
+    _hsdp_for_launch(config)
     return config
 
 
@@ -251,6 +335,30 @@ def qwen3_0_6b_fineweb_edu_run() -> Trainer.Config:
         run_id=1,
         name="qwen3-0.6b_fineweb-edu",
         # No remat: 20.6K tokens/s per L40S at 27 GiB (full: 17.6K, 9 GiB).
+        activation_remat=None,
+        persistent_checkpoint_steps=_PERSISTENT_CHECKPOINT_STEPS,
+    )
+
+
+def qwen3_0_6b_fineweb_edu_nizarun_run() -> Trainer.Config:
+    """qwen3_0_6b_fineweb_edu_run on GOLEM with the paired-corpus English
+    side (~/data/fineweb-edu-ar-nizarun/en). A new id, since the data changed
+    and run 1's W&B run and checkpoints belong to the old cluster."""
+    config = qwen3_0_6b_flex_baseline()
+    # 8192-token microbatches (2 contexts) instead of 16384, so the same
+    # 524,288-token step splits over up to 64 GPUs (8 nodes): one microbatch
+    # per rank on 64 GPUs, two on 32. Global batch, LR and schedule unchanged.
+    num_tokens = 2 * config.training.max_context_length
+    config.training.num_tokens_per_microbatch_per_dp_rank = num_tokens
+    config.dataloader.max_num_documents = c4_document_capacity(num_tokens)
+    validation_tokens = _VALIDATION_BYTES_PER_RANK * QWEN3_LABELS_PER_TEXT_BYTE
+    config.validator = _validator(
+        num_tokens, steps=max(1, round(validation_tokens / num_tokens))
+    )
+    return _named_run(
+        config,
+        run_id=3,
+        name="qwen3-0.6b_fineweb-edu-nizarun",
         activation_remat=None,
         persistent_checkpoint_steps=_PERSISTENT_CHECKPOINT_STEPS,
     )
@@ -278,6 +386,7 @@ def spacebyte_debug_flex(local_lr_multiplier: float = 1.0) -> Trainer.Config:
     _use_fineweb_edu(config)
     config.training.steps = 10
     config.optim.lr_scheduler.warmup_steps = 2
+    _hsdp_for_launch(config)
     return config
 
 
@@ -311,7 +420,7 @@ def _full_validation(
 
 
 def spacebyte_0_6b_flex_full_validation() -> Trainer.Config:
-    """For 2 GPUs: the whole 1M-document split takes about 3 hours to score."""
+    """For 2 GPUs: the whole 825k-document split takes about 2.5 hours to score."""
     return _full_validation(
         spacebyte_0_6b_flex(),
         labels_per_text_byte=BYTE_LABELS_PER_TEXT_BYTE,
@@ -320,7 +429,7 @@ def spacebyte_0_6b_flex_full_validation() -> Trainer.Config:
 
 
 def qwen3_0_6b_flex_baseline_full_validation() -> Trainer.Config:
-    """For 2 GPUs: the whole 1M-document split."""
+    """For 2 GPUs: the whole 825k-document split."""
     return _full_validation(
         qwen3_0_6b_flex_baseline(),
         labels_per_text_byte=QWEN3_LABELS_PER_TEXT_BYTE,
@@ -336,6 +445,39 @@ def qwen3_0_6b_flex_baseline_smoke() -> Trainer.Config:
     return _smoke(qwen3_0_6b_flex_baseline())
 
 
+def qwen3_bpb_smoke() -> Trainer.Config:
+    """Validation with exact BPB, documents starting with EOS-as-BOS."""
+    return use_eos_as_bos(_smoke(qwen3_0_6b_flex_baseline()))
+
+
+def spacebyte_bpb_smoke() -> Trainer.Config:
+    """Validation with exact BPB, documents starting with EOS-as-BOS."""
+    return use_eos_as_bos(_smoke(spacebyte_0_6b_flex()))
+
+
+def qwen3_mixed_loss_smoke() -> Trainer.Config:
+    """Checks MixedLoss wiring: CE + 0.5 x CE (named "aux"), so the logged
+    loss is 1.5 x loss_metrics/cross_entropy; validation scores named losses."""
+    config = _smoke(qwen3_0_6b_flex_baseline())
+    config.metrics = MetricsProcessor.Config(log_freq=1, enable_tensorboard=True)
+    config.dump_folder = "./outputs/mixed_loss_smoke"
+    set_loss(
+        config,
+        {
+            "loss_type": "mixed",
+            "losses": [
+                {"weight": 1.0, "loss": {"loss_type": "cross_entropy"}},
+                {"weight": 0.5, "loss": {"loss_type": "cross_entropy", "name": "aux"}},
+            ],
+        },
+    )
+    config.validator.losses = [
+        {"loss_type": "cross_entropy", "name": "ce"},
+        {"loss_type": "cross_entropy", "name": "ce_again"},
+    ]
+    return config
+
+
 def spacebyte_debug_flex_deterministic() -> Trainer.Config:
     config = _smoke(spacebyte_debug_flex(), steps=10)
     config.debug.seed = 42
@@ -345,6 +487,20 @@ def spacebyte_debug_flex_deterministic() -> Trainer.Config:
 
 def spacebyte_debug_flex_local_lr_x2_smoke() -> Trainer.Config:
     return _smoke(spacebyte_debug_flex(local_lr_multiplier=2.0), steps=10)
+
+
+def qwen3_0_6b_fineweb_edu_bench() -> Trainer.Config:
+    """Throughput of qwen3_0_6b_fineweb_edu_run (same batch, remat and data)
+    over 60 steps, without validation, W&B or periodic checkpoints."""
+    config = qwen3_0_6b_fineweb_edu_run()
+    config.training.steps = 60
+    config.validator = None
+    config.metrics = MetricsProcessor.Config(log_freq=5)
+    config.dump_folder = "./outputs/bench_qwen3"
+    config.checkpointer = CheckpointManager.Config(
+        folder="./outputs/bench_qwen3/checkpoint", interval=10**9
+    )
+    return config
 
 
 # Profiling: one traced step (step 10) on one GPU, no validation.
